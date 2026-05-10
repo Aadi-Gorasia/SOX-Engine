@@ -1,15 +1,19 @@
-import subprocess, threading, select, time
+import subprocess, threading, select, time, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# Works on Render, Codespaces, or any Linux server
+BASE = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.path.join(BASE, "uttt_engine")
+
 engine = subprocess.Popen(
-    ["./uttt_engine"],
+    [ENGINE],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
     stderr=subprocess.DEVNULL, bufsize=0,
-    cwd="/workspaces/codespaces-blank"
+    cwd=BASE
 )
 lock = threading.Lock()
 
-# Drain ALL startup output non-blocking (don't wait for a specific line)
+# Drain all startup output non-blocking
 time.sleep(3)
 while select.select([engine.stdout], [], [], 0.1)[0]:
     engine.stdout.read(4096)
@@ -17,6 +21,7 @@ print("Bridge ready", flush=True)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+
     def do_POST(self):
         n    = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n).decode().strip()
@@ -46,5 +51,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(500); self.end_headers()
                 self.wfile.write(f"error: {e}\n".encode())
 
-print("Listening on :8080", flush=True)
-HTTPServer(("", 8080), Handler).serve_forever()
+    def do_GET(self):
+        # Health check endpoint — Render pings this to keep the service alive
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"SOX Engine online\n")
+
+PORT = int(os.environ.get("PORT", 8080))
+print(f"Listening on :{PORT}", flush=True)
+HTTPServer(("", PORT), Handler).serve_forever()
