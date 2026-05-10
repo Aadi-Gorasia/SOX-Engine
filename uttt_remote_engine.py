@@ -1,64 +1,71 @@
-"""
-uttt_remote_engine_http.py
-──────────────────────────
-Drop-in replacement for uttt_remote_engine.py when the engine is
-exposed via a Cloudflare Quick Tunnel (HTTP, no raw TCP needed).
+import subprocess, threading, select, time, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-Usage:
-    from uttt_remote_engine_http import RemoteEngineHTTP
+BASE   = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.path.join(BASE, "uttt_engine")
+PORT   = int(os.environ.get("PORT", 8080))
 
-    engine = RemoteEngineHTTP(url="https://xxxx.trycloudflare.com")
-    engine.set_elo(1800)
-    engine.set_position([40, 13, 22])
-    move = engine.go()   # returns int 0-80
-    engine.close()       # no-op, kept for API compatibility
-"""
+engine = subprocess.Popen(
+    [ENGINE],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, bufsize=0,
+    cwd=BASE
+)
+lock  = threading.Lock()
+ready = threading.Event()
 
-import urllib.request
-import urllib.error
+def drain_startup():
+    """Drain engine startup output in background — never blocks port binding."""
+    time.sleep(3)
+    while select.select([engine.stdout], [], [], 0.1)[0]:
+        engine.stdout.read(4096)
+    print("Engine ready", flush=True)
+    ready.set()
 
+threading.Thread(target=drain_startup, daemon=True).start()
 
-class RemoteEngineHTTP:
-    def __init__(self, url: str, timeout: float = 120.0):
-        self._url     = url.rstrip("/")
-        self._timeout = timeout
-        self._history: list[int] = []
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
 
-    def _post(self, command: str) -> str:
-        data = command.encode()
-        req  = urllib.request.Request(
-            self._url,
-            data=data,
-            method="POST",
-            headers={"Content-Type": "text/plain",
-                     "Content-Length": str(len(data))},
-        )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            return resp.read().decode().strip()
+    def do_GET(self):
+        # Health check — Render pings this to confirm port is open
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"SOX Engine online\n")
 
-    def set_elo(self, elo: int):
-        self._post(f"elo {elo}")
+    def do_POST(self):
+        # Wait for engine startup drain before processing
+        ready.wait(timeout=10)
 
-    def set_position(self, move_history: list[int]):
-        self._history = list(move_history)
-        moves_str = " ".join(str(m) for m in move_history)
-        self._post(f"position {moves_str}")
+        n     = int(self.headers.get("Content-Length", 0))
+        body  = self.rfile.read(n).decode().strip()
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
 
-    def go(self) -> int:
-        # Send full context in one request so the stateless HTTP bridge works
-        moves_str = " ".join(str(m) for m in self._history)
-        response  = self._post(f"position {moves_str}\ngo")
-        # Response is "bestmove <idx>"
-        parts = response.split()
-        if len(parts) >= 2 and parts[0] == "bestmove":
-            return int(parts[1])
-        raise ValueError(f"Unexpected engine response: {response!r}")
+        with lock:
+            try:
+                for line in lines:
+                    engine.stdin.write((line + "\n").encode())
+                    engine.stdin.flush()
 
-    def close(self):
-        pass  # Nothing to close for HTTP
+                last = lines[-1] if lines else ""
+                if last.startswith("go"):
+                    while True:
+                        resp = engine.stdout.readline().decode()
+                        if resp.startswith("bestmove"):
+                            self.send_response(200); self.end_headers()
+                            self.wfile.write(resp.encode()); return
+                elif last.startswith("elo"):
+                    while True:
+                        resp = engine.stdout.readline().decode()
+                        if "readyok" in resp:
+                            self.send_response(200); self.end_headers()
+                            self.wfile.write(b"readyok\n"); return
+                else:
+                    self.send_response(200); self.end_headers()
+                    self.wfile.write(b"ok\n")
+            except Exception as e:
+                self.send_response(500); self.end_headers()
+                self.wfile.write(f"error: {e}\n".encode())
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
+print(f"Listening on :{PORT}", flush=True)
+HTTPServer(("", PORT), Handler).serve_forever()
