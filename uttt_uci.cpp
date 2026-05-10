@@ -3,9 +3,14 @@
  *  uttt_uci.cpp — UCI-style engine interface for the Python GUI
  * ============================================================================
  *
+ *  DEPLOYMENT: This binary runs on a cloud VM (Oracle Cloud / Hetzner etc.)
+ *  and is managed by uttt_server.py, which exposes it over a TCP socket.
+ *  The Python GUI connects via uttt_remote_engine.py instead of launching
+ *  this process directly.
+ *
  *  PROTOCOL (one command per line via stdin/stdout):
  *
- *  GUI → Engine:
+ *  GUI → Engine (proxied through uttt_server.py over TCP):
  *    elo <N>               Set ELO (100-3500). Engine replies "readyok\n".
  *    position [i1 i2 ...]  Replay game from move history (macro-major indices).
  *    go                    Search and reply "bestmove <idx>\n".
@@ -14,19 +19,25 @@
  *  Engine → GUI:
  *    readyok               Acknowledgement of elo command.
  *    bestmove <idx>        Best move index (0-80), or -1 if game over.
- *    info depth <d> score <s> nodes <n> nps <k>K time <ms>ms
  *
- *  COMPILATION:
- *    macOS:
- *      brew install libomp
- *      g++ -std=c++17 -O3 -march=native -funroll-loops \
- *          -Xpreprocessor -fopenmp -lomp \
- *          -DNDEBUG -o uttt_engine uttt_uci.cpp -lm
+ *  Search info lines are written to stderr so uttt_server.py can log them
+ *  server-side without polluting the protocol stream to the client.
  *
- *    Linux:
- *      g++ -std=c++17 -O3 -march=native -funroll-loops \
- *          -flto -fopenmp -DNDEBUG \
- *          -o uttt_engine uttt_uci.cpp -lm -lpthread
+ *  COMPILATION (Linux VM — recommended):
+ *    g++ -std=c++17 -O3 -march=native -funroll-loops \
+ *        -flto -fopenmp -DNDEBUG \
+ *        -o uttt_engine uttt_uci.cpp -lm -lpthread
+ *
+ *  COMPILATION (macOS local testing only):
+ *    brew install libomp
+ *    g++ -std=c++17 -O3 -march=native -funroll-loops \
+ *        -Xpreprocessor -fopenmp -lomp \
+ *        -DNDEBUG -o uttt_engine uttt_uci.cpp -lm
+ *
+ *  TRANSPOSITION TABLE:
+ *    Cloud VM default: 4 GB (set via TT_DEFAULT_GB below).
+ *    Oracle Free Tier (1 GB RAM): set TT_DEFAULT_GB to 0 (512 MB).
+ *    Hetzner CX32 (8 GB RAM):    set TT_DEFAULT_GB to 6.
  * ============================================================================
  */
 
@@ -41,6 +52,14 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+
+// ─── Cloud TT size config ─────────────────────────────────────────────────────
+//  Reads TT_MB from environment variable — no recompile needed per platform.
+//  Render free (512 MB RAM) → default 64 MB.  Set TT_MB env var to tune:
+//    TT_MB=64    Render free tier
+//    TT_MB=256   Oracle Free Tier (1 GB RAM)
+//    TT_MB=3000  Hetzner CX22    (4 GB RAM)
+//    TT_MB=6000  Hetzner CX32    (8 GB RAM)
 
 // ─── Global definitions (required by the header externs) ─────────────────────
 u64 zobrist_table[TOTAL_SQUARES][2];
@@ -98,12 +117,20 @@ int main() {
 
     init_zobrist();
     init_eval();
-    g_tt.init(1ULL * 1024 * 1024 * 1024);  // 1 GB TT
+
+    // Allocate TT — size from TT_MB env var, default 64 MB for Render free tier
+    const char* tt_env = std::getenv("TT_MB");
+    u64 tt_mb    = tt_env ? static_cast<u64>(std::stoull(tt_env)) : 64ULL;
+    u64 tt_bytes = tt_mb * 1024ULL * 1024ULL;
+    g_tt.init(tt_bytes);
 
     GameState gs;
     gs.reset();
 
-    StrengthProfile sp = elo_to_strength(1500);
+    // Default strength: 1800 ELO — override immediately with "elo <N>" command.
+    // The cloud VM can sustain higher depths than a local machine, so the full
+    // strength ladder in elo_to_strength() is available without throttling.
+    StrengthProfile sp = elo_to_strength(1800);
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -160,7 +187,8 @@ int main() {
                     gs, sp.max_depth, sp.time_ms);
                 chosen = res.best_move;
 
-                // Emit an info line for debugging (Python ignores it)
+                // Search info: written to stderr so uttt_server.py logs it
+                // server-side. It does NOT go through the TCP stream to the GUI.
                 std::cerr << "info depth " << res.depth_reached
                           << " score " << res.best_score
                           << " nodes " << res.nodes
